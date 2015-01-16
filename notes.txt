@@ -1,0 +1,146 @@
+Major steps
+===========
+
+1. Implement automatic neuron model translation.
+2. Implement simple synapses (v += w type).
+3. Implement more general synapses, including plasticity.
+4. Build network on device.
+
+Hardware considerations in brief
+================================
+
+Each SpiNNaker core has the following memory:
+- 32k for instructions, very fast.
+- 64k for data, very fast, typically split between neuron variables and a
+  ring buffer for accumulating synaptic input.
+- 128 MB SDRAM, slow, typically used for synaptic weights and delays.
+  Works a bit like GPU memory in that if you want to fetch or send data to/from
+  the SDRAM, you have to send a whole block, so contiguous access is good and
+  random access is bad. Memory transfer rates are high, but there is a high
+  latency so you want to design algorithms that hide the latency (usually
+  possible).
+  
+Connectivity structure is handled by SpiNNaker and is stored in multicast
+routing tables. We don't need to worry about this. The longest time to send
+a spike from one core to another is about 100 us. There is an optional
+capability to send a 32 bit word payload along with the spike.
+
+Automatic neuron model translation
+==================================
+
+The first stage will be implementing model translation. The way to do this is
+to add a new neuron type to the spinnaker PyNN backend, and then it can be
+used straightforwardly with the rest of their toolchain. Later on we can have
+a full Brian2 SpiNNaker frontend, but this would be substantially more work
+until they refactor their code. Currently core algorithms are specific to PyNN
+but they will refactor this to a common frontend package.
+
+Model definition to fit with sPyNNaker package has following directory
+structure:
+
+modelname/
+  __init__.py
+  model.py
+  model_binaries/
+     __init__.py (empty)
+     modelname.aplx (compiled binary file)
+  neural_models/
+     modelname.c
+     modelname.h
+
+The structure of this is:
+
+- Definition of neuron variables goes in modelname.h as a neuron_t struct
+- Per-neuron state update / threshold / reset code comes from a single
+  function call neuron_state_update(...) in model.c.
+- Definition of the Python part of the model goes in model.py.
+
+There are currently a few different options for variables types:
+- Fixed point S16.15
+- Software emulated float (soft float), 6x slower than fix
+- Software emulated double (same problem)
+
+In the long term, we want to support fixed point for speed but automatically
+optimising for using fixed is a non-trivial research problem (but doable). In
+the short term we just want to use either non-optimised fixed point or
+soft float. In the very short term, the Python interface only supports fixed
+point at the moment, but this will be fixed by them fairly soon so we can
+use soft float.
+
+To implement model.c it should be as simple as implementing a template and
+just generating snippets. Instead of loading data from arrays, we do things
+like V = neuron->V.
+
+To implement model.h it is straightforwardly enumerating the variables.
+
+Implementing model.py is more complicated. To use Brian's synaptic model, we
+would like to use what they call Delta synapses (that is, the synapses have
+no internal dynamics of their own and this is handled in the neuron model
+instead). Unfortunately, there's no way to access this from the Python
+side at the moment so we need to wait until we have access to this.
+
+To implement a model you really need to do just a few things on the Python side:
+- In model.py, change all the names of classes, etc.
+- In model.py, choose the right base classes to derive from. This is not
+  entirely straightforward and I got the impression that at the moment is
+  subject to change and so it might be a bit of a moving target. This is where
+  the Delta synapse part needs to be introduced.
+- In model.py, make the get_parameters() method return parameters in the same
+  order as they are defined in neuron_t in model.h.
+- In model.py put a limit to how many neurons can be simulated per core and
+  how many CPU cycles it takes per neuron. In their own code, they just guess
+  at this and there is no support for doing this automatically or accurately
+  I think.
+- in __init__.py register the directory where the executable can be found.
+
+Simple synapses
+===============
+
+To implement simple synapses of the form v += w would be possible. On the Brian
+side we'd need to implement a check that the synapses are of the required form
+and transform a few variable names. This is similar to what is done already
+in brian2genn so we more or less can handle this. Note that there is a
+restriction to two target variables / types of synapses per neuron and data
+has to be transformed into 16 bit fixed point. See below for more on why and
+how to get around this restriction. 
+
+At this stage, I'm not entirely clear on what would have to be done to fit
+in with their tools. I think we need to wait on them to refactor their code
+so that multiple frontends are possible, and then see how to connect to this
+refactored frontend. Essentially though, if we can give them a list of synapses
+either as arrays or files then we should be good to go. See below on building
+connectivity on the device for a longer term / larger scale possibility.
+
+General synapses and plasticity
+===============================
+
+The memory model is particular for synaptic transmission and tricky for
+plasticity. Because weights are only stored at the target core, backpropagated
+spikes cannot execute any code that reads or modifies those weights. I think
+we can get around this for STDP by using the spike routing architecture to
+send small messages with payloads including the data required. However, this
+isn't the way they've done it so far. Instead, they use a trick with delayed
+weight updates. I don't yet understand how this works, but I think they do
+something like our "RecentStateMonitor" trick in Brian 1 which is heavy on
+memory usage.
+
+In their current implementation (others are possible but would require a more
+substantial low level rewrite of their code), the effect of synapses are
+accumulated into a ring buffer in much the same way that they were done in
+the DelayConnection in Brian 1. Note that this restricts you to additive
+Synapses. There is also a restriction currently to having precisely two
+ring buffers (for excitatory and inhibitory synapses), although this could
+be relatively easily modified on their side. Note that the ring buffers
+also store data as 16 bit fixed points, so you need to do some scaling.
+This could also be modified (not so straightforward) but using more bits
+would be a big restriction on how many neurons you can get per core.
+
+Network construction on device
+==============================
+
+When simulations get very large it won't be possible to build them on the host
+and upload them, so we will need a way to specify how to build connectivity
+on spinnaker boards. The spinnaker team are currently working on this and it
+seems to me that it's the same problem as our one of specifying connectivity
+in a way that can be used with code generation. I'm meeting with them soon to 
+discuss ideas about how this could work.
